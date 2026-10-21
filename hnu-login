@@ -1,0 +1,370 @@
+#!/bin/sh
+# hnu-login — 湖南大学校园网自动登录（Dr.COM EPortal）
+# 适用于 OpenWrt / BusyBox ash，不依赖 Python。
+#
+# 用法: hnu-login {status|login|watch|debug|encode <文本>}
+# 配置: /etc/hnu-login.conf（可用环境变量 HNU_CONFIG 指定其它路径）
+
+CONFIG="${HNU_CONFIG:-/etc/hnu-login.conf}"
+PORTAL_JS_VERSION="4.2.1"
+
+# ---------------------------------------------------------------- 配置
+[ -f "$CONFIG" ] && . "$CONFIG"
+
+: "${enabled:=1}"
+: "${username:=}"
+: "${password:=}"
+: "${isp:=campus}"
+: "${account_prefix:=,0,}"
+: "${interval:=60}"
+: "${max_backoff:=1800}"
+: "${portal_host:=web.hnu.edu.cn}"
+: "${portal_ip:=}"
+: "${eportal_port:=801}"
+
+# 兼容在 Windows 上编辑配置文件后留下的 CRLF
+enabled=$(printf '%s' "$enabled" | tr -d '\r')
+username=$(printf '%s' "$username" | tr -d '\r')
+password=$(printf '%s' "$password" | tr -d '\r')
+isp=$(printf '%s' "$isp" | tr -d '\r')
+account_prefix=$(printf '%s' "$account_prefix" | tr -d '\r')
+interval=$(printf '%s' "$interval" | tr -d '\r')
+max_backoff=$(printf '%s' "$max_backoff" | tr -d '\r')
+portal_host=$(printf '%s' "$portal_host" | tr -d '\r')
+portal_ip=$(printf '%s' "$portal_ip" | tr -d '\r')
+eportal_port=$(printf '%s' "$eportal_port" | tr -d '\r')
+
+# 数值项校验，避免配置写错导致 sleep/端口异常
+case "$interval" in ''|*[!0-9]*) interval=60 ;; esac
+case "$max_backoff" in ''|*[!0-9]*) max_backoff=1800 ;; esac
+case "$eportal_port" in ''|*[!0-9]*) eportal_port=801 ;; esac
+
+# ---------------------------------------------------------------- 日志
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+    command -v logger >/dev/null 2>&1 && logger -t hnu-login "$*"
+}
+
+# ---------------------------------------------------------------- HTTP
+http_get() {
+    if command -v wget >/dev/null 2>&1; then
+        wget -q -T 10 -O - "$1" 2>/dev/null
+    elif command -v curl >/dev/null 2>&1; then
+        curl -sS -m 10 "$1" 2>/dev/null
+    elif command -v uclient-fetch >/dev/null 2>&1; then
+        uclient-fetch -q -T 10 -O - "$1" 2>/dev/null
+    else
+        return 127
+    fi
+}
+
+# URL 百分号编码。优先用 od（按字节，支持中文）；
+# 有些 OpenWrt 的 BusyBox 没编译 od，则退回纯 shell 逐字符编码（ASCII 密码）。
+urlencode() {
+    _ue_in="$1"
+    _ue_out=""
+    if command -v od >/dev/null 2>&1; then
+        for _ue_b in $(printf '%s' "$_ue_in" | od -An -v -tu1); do
+            _ue_out="$_ue_out$(printf '%%%02X' "$_ue_b")"
+        done
+    else
+        while [ -n "$_ue_in" ]; do
+            _ue_c=${_ue_in%"${_ue_in#?}"}
+            _ue_in=${_ue_in#?}
+            case "$_ue_c" in
+                [A-Za-z0-9._~-]) _ue_out="$_ue_out$_ue_c" ;;
+                *) _ue_out="$_ue_out$(printf '%%%02X' "'$_ue_c")" ;;
+            esac
+        done
+    fi
+    printf '%s' "$_ue_out"
+}
+
+# ---------------------------------------------------------------- JSONP 解析
+get_result() {
+    printf '%s' "$1" | sed -n 's/.*"result"[[:space:]]*:[[:space:]]*\([^,}]*\).*/\1/p' | tr -d '" '
+}
+
+get_field() {
+    printf '%s' "$1" | sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
+}
+
+get_num_field() {
+    printf '%s' "$1" | sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*\([0-9-]*\).*/\1/p' | head -n 1
+}
+
+is_online() {
+    _io_result=$(get_result "$1")
+    [ "$_io_result" = "1" ] || [ "$_io_result" = "ok" ]
+}
+
+login_ok() {
+    _lo_result=$(get_result "$1")
+    if [ "$_lo_result" = "1" ] || [ "$_lo_result" = "ok" ]; then
+        return 0
+    fi
+    [ "$(get_num_field "$1" ret_code)" = "2" ]
+}
+
+msg_of() {
+    _mo_msg=$(get_field "$1" msg)
+    [ -n "$_mo_msg" ] || _mo_msg="$1"
+    printf '%s' "$_mo_msg"
+}
+
+# ---------------------------------------------------------------- 出口
+isp_suffix() {
+    case "$isp" in
+        telecom|电信|2|'@telecom') printf '%s' '@telecom' ;;
+        campus|校园网|1|'')        printf '%s' '' ;;
+        *)                         printf '%s' "$isp" ;;
+    esac
+}
+
+isp_label() {
+    case "$(isp_suffix)" in
+        '')         printf '%s' '校园网' ;;
+        '@telecom') printf '%s' '电信' ;;
+        *)          printf '%s' "$(isp_suffix)" ;;
+    esac
+}
+
+# ---------------------------------------------------------------- 网络信息
+wan_ip() {
+    if command -v ifstatus >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1; then
+        _wip=$(ifstatus wan 2>/dev/null | jsonfilter -e '@.ipv4-address[0].address' 2>/dev/null)
+        [ -n "$_wip" ] && { printf '%s' "$_wip"; return 0; }
+    fi
+    ip -4 route get 223.5.5.5 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n 1
+}
+
+# 未认证时校园网可能拦截 DNS；portal_ip 非空时自动回退到 IP
+active_host="$portal_host"
+
+choose_portal_host() {
+    active_host="$portal_host"
+    [ -n "$portal_ip" ] || return 0
+    if ! http_get "http://$portal_host/drcom/chkstatus?callback=probe&v=$(date +%s)" >/dev/null 2>&1; then
+        active_host="$portal_ip"
+    fi
+}
+
+get_status() {
+    _gs_url="http://$active_host/drcom/chkstatus?callback=dr$$&v=$(date +%s)&lang=zh&jsVersion=$PORTAL_JS_VERSION"
+    _gs_resp=$(http_get "$_gs_url") || return 1
+    [ -n "$_gs_resp" ] || return 1
+    printf '%s' "$_gs_resp"
+}
+
+build_login_url() {
+    _bl_status="$1"
+
+    _bl_ip=$(get_field "$_bl_status" v46ip)
+    [ -n "$_bl_ip" ] || _bl_ip=$(get_field "$_bl_status" ss5)
+    [ -n "$_bl_ip" ] || _bl_ip=$(wan_ip)
+    [ -n "$_bl_ip" ] || { log "无法获取本机认证 IP"; return 1; }
+
+    _bl_ac=$(get_field "$_bl_status" ss6)
+    [ -n "$_bl_ac" ] || _bl_ac=$(get_field "$_bl_status" v4serip)
+
+    _bl_account="$account_prefix$username$(isp_suffix)"
+    _bl_qs="callback=dr$$"
+    _bl_qs="$_bl_qs&login_method=1"
+    _bl_qs="$_bl_qs&user_account=$(urlencode "$_bl_account")"
+    _bl_qs="$_bl_qs&user_password=$(urlencode "$password")"
+    _bl_qs="$_bl_qs&wlan_user_ip=$(urlencode "$_bl_ip")"
+    _bl_qs="$_bl_qs&wlan_user_ipv6="
+    _bl_qs="$_bl_qs&wlan_user_mac=000000000000"
+    _bl_qs="$_bl_qs&wlan_ac_ip=$(urlencode "$_bl_ac")"
+    _bl_qs="$_bl_qs&wlan_ac_name="
+    _bl_qs="$_bl_qs&jsVersion=$PORTAL_JS_VERSION"
+    _bl_qs="$_bl_qs&terminal_type=1"
+    _bl_qs="$_bl_qs&lang=zh"
+    _bl_qs="$_bl_qs&v=$(date +%s)"
+
+    printf '%s' "http://$active_host:$eportal_port/eportal/portal/login?$_bl_qs"
+}
+
+do_login() {
+    _dl_url=$(build_login_url "$1") || return 1
+    http_get "$_dl_url"
+}
+
+verify_online() {
+    _vo_try=1
+    while [ "$_vo_try" -le 3 ]; do
+        sleep 1
+        _vo_st=$(get_status 2>/dev/null) || { _vo_try=$((_vo_try + 1)); continue; }
+        is_online "$_vo_st" && return 0
+        _vo_try=$((_vo_try + 1))
+    done
+    return 1
+}
+
+need_credentials() {
+    if [ -z "$username" ] || [ -z "$password" ]; then
+        log "请先在 $CONFIG 中填写 username 和 password"
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------- 命令
+cmd_status() {
+    choose_portal_host
+    _cs_st=$(get_status) || { log "无法连接认证服务器（检查网络或 DNS）"; return 2; }
+    if is_online "$_cs_st"; then
+        _cs_uid=$(get_field "$_cs_st" uid)
+        log "当前已在线${_cs_uid:+（账号 $_cs_uid）}；配置出口：$(isp_label)。"
+        return 0
+    fi
+    log "当前未认证（需要登录）；配置出口：$(isp_label)。"
+    return 1
+}
+
+cmd_login() {
+    need_credentials || return 2
+
+    choose_portal_host
+    _cl_st=$(get_status) || { log "无法连接认证服务器（检查网络或 DNS）"; return 2; }
+    if is_online "$_cl_st"; then
+        log "当前已在线，无需重复登录。"
+        return 0
+    fi
+
+    log "检测到未认证，正在登录（出口：$(isp_label)）……"
+    _cl_resp=$(do_login "$_cl_st") || { log "登录请求失败"; return 2; }
+
+    if login_ok "$_cl_resp"; then
+        if verify_online; then
+            log "认证成功，已恢复上网。"
+        else
+            log "认证接口返回成功，但状态查询暂未在线（可能稍后生效）。"
+        fi
+        return 0
+    fi
+
+    log "登录失败：$(msg_of "$_cl_resp")"
+    return 1
+}
+
+cmd_debug() {
+    _db_client="none"
+    command -v wget >/dev/null 2>&1 && _db_client="wget"
+    command -v curl >/dev/null 2>&1 && _db_client="curl"
+    command -v uclient-fetch >/dev/null 2>&1 && _db_client="uclient-fetch"
+
+    choose_portal_host
+    log "配置: portal=$portal_host${portal_ip:+/$portal_ip} 实际使用=$active_host:$eportal_port 出口=$(isp_label) 账号=$username 间隔=${interval}s http=$_db_client"
+
+    _db_st=$(get_status) || { log "状态查询失败"; return 2; }
+    log "chkstatus: $_db_st"
+    log "认证 IP=$(get_field "$_db_st" v46ip) AC=$(get_field "$_db_st" ss6)"
+
+    if _db_url=$(build_login_url "$_db_st"); then
+        _db_safe=$(printf '%s' "$_db_url" | sed 's/user_password=[^&]*/user_password=***/')
+        log "登录 URL（密码已隐藏）: $_db_safe"
+    fi
+    return 0
+}
+
+cmd_encode() {
+    urlencode "$1"
+    echo
+}
+
+watch_loop() {
+    need_credentials || return 2
+
+    _wl_state=""
+    _wl_fails=0
+    log "自动登录守护已启动（每 ${interval}s 检查一次，出口：$(isp_label)）"
+
+    while :; do
+        choose_portal_host
+        if _wl_st=$(get_status); then
+            if is_online "$_wl_st"; then
+                if [ "$_wl_state" != "online" ]; then
+                    _wl_uid=$(get_field "$_wl_st" uid)
+                    log "已在线${_wl_uid:+（账号 $_wl_uid）}。"
+                fi
+                _wl_state="online"
+                _wl_fails=0
+                sleep "$interval"
+                continue
+            fi
+
+            if [ "$_wl_state" != "offline" ]; then
+                log "检测到未认证（或已掉线），开始登录……"
+            fi
+            _wl_state="offline"
+
+            if _wl_resp=$(do_login "$_wl_st"); then
+                if login_ok "$_wl_resp"; then
+                    if verify_online; then
+                        log "认证成功，已在线。"
+                        _wl_state="online"
+                    else
+                        log "认证接口返回成功，但状态暂未在线，稍后重试。"
+                    fi
+                    _wl_fails=0
+                else
+                    _wl_msg=$(msg_of "$_wl_resp")
+                    _wl_fails=$((_wl_fails + 1))
+                    log "登录失败：$_wl_msg"
+
+                    case "$_wl_msg" in
+                        *ldap*|*LDAP*|*密码*|*passwd*|*password*|*账号*|*用户*)
+                            [ "$_wl_fails" -gt 5 ] && _wl_fails=5
+                            _wl_wait=$((interval * (1 << _wl_fails)))
+                            [ "$_wl_wait" -lt 120 ] && _wl_wait=120
+                            [ "$_wl_wait" -gt "$max_backoff" ] && _wl_wait="$max_backoff"
+                            log "连续认证失败 $_wl_fails 次，为避免账号被锁定，等待 ${_wl_wait}s 后重试（请检查学号/密码/出口）。"
+                            ;;
+                        *)
+                            _wl_wait="$interval"
+                            ;;
+                    esac
+
+                    sleep "$_wl_wait"
+                    continue
+                fi
+            else
+                log "登录请求失败（无法连接认证服务器）"
+            fi
+        else
+            if [ "$_wl_state" != "unreachable" ]; then
+                log "无法连接认证服务器（可能未接入校园网或 DNS 未就绪），稍后自动重试。"
+            fi
+            _wl_state="unreachable"
+        fi
+
+        sleep "$interval"
+    done
+}
+
+usage() {
+    cat <<EOF
+用法: $0 {status|login|watch|debug|encode <文本>}
+  status        查看当前认证状态
+  login         登录一次
+  watch         常驻运行，掉线自动重连
+  debug         显示配置和状态接口原始返回（不含密码）
+  encode TEXT   输出 URL 编码结果（调试用）
+配置文件: $CONFIG
+EOF
+}
+
+case "${1:-login}" in
+    status)  cmd_status ;;
+    login)   cmd_login ;;
+    watch)
+        [ "$enabled" = "1" ] || { log "配置中 enabled=0，不启动"; exit 0; }
+        watch_loop
+        ;;
+    debug)   cmd_debug ;;
+    encode)  cmd_encode "$2" ;;
+    -h|--help|help) usage ;;
+    *)       usage; exit 2 ;;
+esac
+
+exit $?

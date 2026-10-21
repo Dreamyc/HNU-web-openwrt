@@ -1,0 +1,29 @@
+#!/bin/sh /etc/rc.common
+# 湖南大学校园网自动登录 —— OpenWrt procd 服务
+
+START=99
+STOP=10
+USE_PROCD=1
+
+CONF=/etc/hnu-login.conf
+
+start_service() {
+    [ -f "$CONF" ] || {
+        logger -t hnu-login "缺少配置文件 $CONF"
+        return 1
+    }
+
+    . "$CONF"
+    enabled=$(printf '%s' "${enabled:-1}" | tr -d '\r')
+    [ "$enabled" = "1" ] || {
+        logger -t hnu-login "配置中 enabled=0，不启动"
+        return 0
+    }
+
+    procd_open_instance
+    procd_set_param command /bin/sh /usr/bin/hnu-login watch
+    procd_set_param respawn 3600 5 5
+    procd_set_param stdout 0
+    procd_set_param stderr 0
+    procd_close_instance
+}

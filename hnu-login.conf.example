@@ -1,0 +1,33 @@
+# /etc/hnu-login.conf
+# 湖南大学校园网自动登录配置
+# 注意：本文件是 shell 语法，值请用单引号包起来。
+
+# 是否启用（1=启用，0=禁用；供 init 脚本判断）
+enabled=1
+
+# 学号 / 工号
+username='YOUR_STUDENT_ID'
+
+# 学校统一身份认证密码
+# 如果密码里本身有单引号，写成 '\''（例如 ab'cd -> 'ab'\''cd'）
+password='YOUR_PASSWORD'
+
+# 上网出口：campus = 校园网，telecom = 电信
+isp='campus'
+
+# Dr.COM 终端前缀：电脑/路由器为 ,0,
+account_prefix=',0,'
+
+# 在线状态检查间隔（秒）
+interval=60
+
+# 连续认证失败后的最长退避时间（秒），防止账号被临时锁定
+max_backoff=1800
+
+# 认证服务器
+portal_host='web.hnu.edu.cn'
+# 未认证时校园网可能拦截 DNS。填上认证服务器 IP 作为回退，
+# 脚本会先试域名，访问不通时自动改用这个 IP。
+# 认证服务器 IP 可在已联网设备上执行 nslookup web.hnu.edu.cn 获取。
+portal_ip=''
+eportal_port='801'
